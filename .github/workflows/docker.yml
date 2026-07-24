@@ -1,6 +1,7 @@
 name: Docker image
 
-# Builds and publishes the public Buzz relay image as ghcr.io/block/buzz.
+# Builds the Buzz relay image and publishes Protecio's managed runtime to its
+# private Artifact Registry using keyless GitHub OIDC.
 #
 # Strategy: each architecture builds on its native runner (ubuntu-24.04 for
 # amd64, ubuntu-24.04-arm for arm64), pushes to GHCR by digest, then a final
@@ -74,6 +75,9 @@ env:
   # namespace without forking this file).
   IMAGE_NAME: ${{ vars.GHCR_IMAGE != '' && vars.GHCR_IMAGE || format('ghcr.io/{0}/buzz', github.repository_owner) }}
   PUSH_GATEWAY_IMAGE: ${{ vars.GHCR_PUSH_GATEWAY_IMAGE != '' && vars.GHCR_PUSH_GATEWAY_IMAGE || format('ghcr.io/{0}/buzz-push-gateway', github.repository_owner) }}
+  GAR_IMAGE: northamerica-northeast1-docker.pkg.dev/protecio-ai-503315/protecio-runtime/buzz
+  GCP_WORKLOAD_IDENTITY_PROVIDER: projects/877229499544/locations/global/workloadIdentityPools/github/providers/protecio-repo
+  GCP_PUBLISHER_SERVICE_ACCOUNT: protecio-buzz-publisher@protecio-ai-503315.iam.gserviceaccount.com
 
 jobs:
   build:
@@ -282,8 +286,52 @@ jobs:
           subject-digest: ${{ steps.manifest.outputs.digest }}
           push-to-registry: true
 
+      - name: Authenticate to Protecio Cloud without a service-account key
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093  # v3
+        with:
+          workload_identity_provider: ${{ env.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ env.GCP_PUBLISHER_SERVICE_ACCOUNT }}
+
+      - name: Configure the private Protecio registry
+        uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db  # v3
+
+      - name: Publish the managed runtime to private Artifact Registry
+        id: private
+        env:
+          GAR_IMAGE: ${{ env.GAR_IMAGE }}
+          META_TAGS: ${{ steps.meta.outputs.tags }}
+          MERGED_DIGEST: ${{ steps.manifest.outputs.digest }}
+          SOURCE_IMAGE: ${{ env.IMAGE_NAME }}
+        run: |
+          set -euo pipefail
+          gcloud auth configure-docker northamerica-northeast1-docker.pkg.dev --quiet
+
+          private_tags=()
+          while IFS= read -r source_tag; do
+            [ -n "$source_tag" ] || continue
+            private_tags+=("-t" "${GAR_IMAGE}:${source_tag##*:}")
+          done <<< "$META_TAGS"
+
+          docker buildx imagetools create \
+            "${private_tags[@]}" \
+            "${SOURCE_IMAGE}@${MERGED_DIGEST}"
+
+          first_private_tag="${GAR_IMAGE}:$(echo "$META_TAGS" | head -n1 | awk -F: '{print $NF}')"
+          private_digest="$(docker buildx imagetools inspect "$first_private_tag" \
+            --format '{{json .Manifest}}' | jq -r '.digest')"
+          test "$private_digest" = "$MERGED_DIGEST"
+          echo "digest=${private_digest}" >> "$GITHUB_OUTPUT"
+
+      - name: Attest provenance for the private Protecio runtime
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373  # v4.1.1
+        with:
+          subject-name: ${{ env.GAR_IMAGE }}
+          subject-digest: ${{ steps.private.outputs.digest }}
+          push-to-registry: true
+
       - name: Summary
         env:
+          GAR_IMAGE: ${{ env.GAR_IMAGE }}
           IMAGE_NAME: ${{ env.IMAGE_NAME }}
           MERGED_DIGEST: ${{ steps.manifest.outputs.digest }}
           META_TAGS: ${{ steps.meta.outputs.tags }}
@@ -301,6 +349,11 @@ jobs:
             echo "Verify provenance:"
             echo '```'
             echo "gh attestation verify oci://${IMAGE_NAME}@${MERGED_DIGEST} --owner ${GITHUB_REPOSITORY_OWNER}"
+            echo '```'
+            echo
+            echo "Protecio managed runtime (private):"
+            echo '```'
+            echo "${GAR_IMAGE}@${MERGED_DIGEST}"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
