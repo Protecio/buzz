@@ -117,11 +117,12 @@ FROM debian:${DEBIAN_VERSION}-slim AS runtime
 # OCI annotations: required for GHCR to auto-link the image to this repo and
 # inherit its visibility. org.opencontainers.image.source is the load-bearing
 # one — without it GHCR keeps the image private even when the repo is public.
-LABEL org.opencontainers.image.title="Buzz" \
-      org.opencontainers.image.description="WebSocket relay server for the Buzz communications platform" \
-      org.opencontainers.image.source="https://github.com/block/buzz" \
-      org.opencontainers.image.url="https://github.com/block/buzz" \
-      org.opencontainers.image.documentation="https://github.com/block/buzz#readme" \
+LABEL org.opencontainers.image.title="Protecio Buzz" \
+      org.opencontainers.image.description="Protecio-secured Buzz relay and browser workspace" \
+      org.opencontainers.image.source="https://github.com/Protecio/buzz" \
+      org.opencontainers.image.url="https://github.com/Protecio/buzz" \
+      org.opencontainers.image.documentation="https://github.com/Protecio/buzz#readme" \
+      org.opencontainers.image.vendor="Protecio" \
       org.opencontainers.image.licenses="Apache-2.0"
 
 RUN apt-get update \

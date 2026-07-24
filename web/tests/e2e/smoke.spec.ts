@@ -69,10 +69,10 @@ test("invite requires age and legal consent before opening Buzz", async ({
   await page.goto("/invite/demo-code");
 
   await expect(
-    page.getByRole("link", { name: "Download it now" }),
-  ).toHaveAttribute(
-    "href",
-    "https://github.com/block/buzz/releases/download/v0.4.9/Buzz_0.4.9_x64-setup_alpha-unsigned.exe",
+    page.getByText("Your protected browser identity stays on this device."),
+  ).toBeVisible();
+  await expect(page.getByRole("link", { name: "Download it now" })).toHaveCount(
+    0,
   );
 
   const ageConfirmation = page.getByLabel("I am 18 years of age or older.");
@@ -120,34 +120,9 @@ test("invite requires age and legal consent before opening Buzz", async ({
   expect(consentBox?.width).toBe(acceptButtonBox?.width);
 });
 
-test("invite can enroll a NIP-07 identity for browser access", async ({
+test("invite can enroll a durable local identity for browser access", async ({
   page,
 }) => {
-  const pubkey = "ab".repeat(32);
-  await page.addInitScript((extensionPubkey) => {
-    (
-      window as Window & {
-        nostr?: {
-          getPublicKey(): Promise<string>;
-          signEvent(
-            event: Record<string, unknown>,
-          ): Promise<Record<string, unknown>>;
-        };
-      }
-    ).nostr = {
-      async getPublicKey() {
-        return extensionPubkey;
-      },
-      async signEvent(event) {
-        return {
-          ...event,
-          id: "cd".repeat(32),
-          pubkey: extensionPubkey,
-          sig: "ef".repeat(64),
-        };
-      },
-    };
-  }, pubkey);
   await page.route("**/api/join-policy", async (route) => {
     await route.fulfill({
       status: 200,
@@ -156,14 +131,11 @@ test("invite can enroll a NIP-07 identity for browser access", async ({
     });
   });
 
-  let claimObserved = false;
+  const claimedPubkeys: string[] = [];
   await page.route("**/api/invites/claim", async (route) => {
-    claimObserved = true;
     const request = route.request();
     const body = request.postData() ?? "";
-    expect(JSON.parse(body)).toEqual({
-      code: "browser-code",
-    });
+    expect(JSON.parse(body).code).toMatch(/^browser-code/);
 
     const authorization = request.headers().authorization;
     expect(authorization).toMatch(/^Nostr /);
@@ -175,7 +147,8 @@ test("invite can enroll a NIP-07 identity for browser access", async ({
       pubkey: string;
       tags: string[][];
     };
-    expect(event.pubkey).toBe(pubkey);
+    expect(event.pubkey).toMatch(/^[0-9a-f]{64}$/);
+    claimedPubkeys.push(event.pubkey);
     expect(event.tags).toContainEqual(["u", request.url()]);
     expect(event.tags).toContainEqual(["method", "POST"]);
     expect(event.tags).toContainEqual([
@@ -198,10 +171,14 @@ test("invite can enroll a NIP-07 identity for browser access", async ({
   await page.goto("/invite/browser-code");
   await page.getByRole("button", { name: "Join in browser" }).click();
   await expect(page).toHaveURL("/");
-  expect(claimObserved).toBe(true);
+  await page.goto("/invite/browser-code-after-reload");
+  await page.getByRole("button", { name: "Join in browser" }).click();
+  await expect(page).toHaveURL("/");
+  expect(claimedPubkeys).toHaveLength(2);
+  expect(claimedPubkeys[1]).toBe(claimedPubkeys[0]);
 });
 
-test("invite asks Safari users to choose their Mac download", async ({
+test("invite stays browser-first on Safari-compatible devices", async ({
   browser,
 }) => {
   const context = await browser.newContext({
@@ -223,44 +200,20 @@ test("invite asks Safari users to choose their Mac download", async ({
       body: JSON.stringify({ policy: null }),
     });
   });
-  await page.route("https://api.github.com/**", async (route) => {
-    await route.fulfill({ status: 500 });
-  });
-
   await page.goto("/invite/demo-code");
-  const download = page.getByRole("link", { name: "Download it now" });
-  await expect(download).toHaveAttribute("aria-haspopup", "dialog");
-  await download.click();
-
-  const chooser = page.getByRole("dialog", {
-    name: "Which Mac do you have?",
-  });
-  await expect(chooser).toBeVisible();
-  await expect(chooser.getByRole("link", { name: /Newer Mac/ })).toContainText(
-    "2021 or later, or a late-2020 Mac with an Apple M1 chip",
+  await expect(
+    page.getByRole("button", { name: "Join in browser" }),
+  ).toBeVisible();
+  await expect(
+    page.getByText("Your protected browser identity stays on this device."),
+  ).toBeVisible();
+  await expect(page.getByRole("link", { name: "Download it now" })).toHaveCount(
+    0,
   );
-  await expect(chooser.getByRole("link", { name: /Older Mac/ })).toContainText(
-    "2019 or earlier, or a 2020 Mac with an Intel processor",
-  );
-  await expect(chooser.getByText("About This Mac")).toBeVisible();
-
-  const openedPagePromise = context.waitForEvent("page");
-  await chooser.getByRole("link", { name: /Newer Mac/ }).click();
-  const openedPage = await openedPagePromise;
-  await expect(chooser).toBeHidden();
-  await expect(openedPage).toHaveURL("https://github.com/block/buzz/releases");
-  await expect(page).toHaveURL(/\/invite\/demo-code$/);
-  await openedPage.close();
-
-  await download.click();
-  await expect(chooser).toBeVisible();
-  await page.keyboard.press("Escape");
-  await expect(chooser).toBeHidden();
-  await expect(download).toBeFocused();
   await context.close();
 });
 
-test("invite download falls back for mobile and non-desktop devices", async ({
+test("invite stays browser-first on mobile and ChromeOS", async ({
   browser,
 }) => {
   const unsupportedDevices = [
@@ -313,37 +266,15 @@ test("invite download falls back for mobile and non-desktop devices", async ({
         body: JSON.stringify({ policy: null }),
       });
     });
-    await page.route("https://api.github.com/**", async (route) => {
-      await route.fulfill({
-        status: 200,
-        contentType: "application/json",
-        headers: { "Access-Control-Allow-Origin": "*" },
-        body: JSON.stringify([
-          {
-            draft: false,
-            prerelease: false,
-            assets: [
-              {
-                name: "Buzz_0.4.9_x64.dmg",
-                browser_download_url:
-                  "https://github.com/block/buzz/releases/download/v0.4.9/Buzz_0.4.9_x64.dmg",
-              },
-              {
-                name: "Buzz_0.4.9_amd64.AppImage",
-                browser_download_url:
-                  "https://github.com/block/buzz/releases/download/v0.4.9/Buzz_0.4.9_amd64.AppImage",
-              },
-            ],
-          },
-        ]),
-      });
-    });
-
     await page.goto("/invite/demo-code");
+    await expect(
+      page.getByRole("button", { name: "Join in browser" }),
+      device.name,
+    ).toBeVisible();
     await expect(
       page.getByRole("link", { name: "Download it now" }),
       device.name,
-    ).toHaveAttribute("href", "https://github.com/block/buzz/releases");
+    ).toHaveCount(0);
     await context.close();
   }
 });
