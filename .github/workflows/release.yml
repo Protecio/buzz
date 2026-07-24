@@ -3,7 +3,7 @@ name: Release
 on:
   push:
     tags:
-      - 'v[0-9]*'
+      - "v[0-9]*"
   workflow_dispatch:
     inputs:
       version:
@@ -137,13 +137,13 @@ jobs:
           cargo build --release -p buzz-acp -p buzz-agent -p buzz-dev-mcp -p git-credential-nostr -p buzz-cli
           ./scripts/bundle-sidecars.sh
 
-      # Mesh rev derived from Cargo.lock (no lockstep edit on dep bump); cache key tracks it.
+      # Derive the checkout from the dependency declaration, not a stale lockfile.
       - name: Resolve mesh-llm rev
         id: mesh_rev
         run: |
           set -euo pipefail
-          REV=$(python3 -c 'import tomllib; d=tomllib.load(open("Cargo.lock", "rb")); p=next(p for p in d["package"] if p["name"] == "mesh-llm-sdk"); print(p["source"].rsplit("#", 1)[1])')
-          [[ -n "$REV" ]] || { echo "::error::could not resolve mesh-llm rev from Cargo.lock"; exit 1; }
+          REV=$(python3 -c 'import tomllib; d=tomllib.load(open("desktop/src-tauri/Cargo.toml", "rb")); print(d["dependencies"]["mesh-llm-sdk"]["rev"])')
+          [[ "$REV" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::could not resolve the pinned mesh-llm rev from desktop/src-tauri/Cargo.toml"; exit 1; }
           echo "rev=$REV" >> "$GITHUB_OUTPUT"
           echo "short=${REV:0:7}" >> "$GITHUB_OUTPUT"
       - name: Restore mesh llama build cache
@@ -155,14 +155,20 @@ jobs:
       - name: Build mesh llama native libraries
         if: steps.llama_cache.outputs.cache-hit != 'true'
         env:
+          MESH_REV: ${{ steps.mesh_rev.outputs.rev }}
           MESH_REV_SHORT: ${{ steps.mesh_rev.outputs.short }}
         run: |
           set -euo pipefail
           cargo fetch --manifest-path desktop/src-tauri/Cargo.toml
-          SHORT="$MESH_REV_SHORT"
-          MESH_ROOT=$(find "${CARGO_HOME:-$HOME/.cargo}/git/checkouts" -path "*/$SHORT" -type d -name "$SHORT" | head -1)
+          MESH_ROOT=""
+          while IFS= read -r candidate; do
+            if [[ "$(git -C "$candidate" rev-parse HEAD 2>/dev/null || true)" == "$MESH_REV" ]]; then
+              MESH_ROOT="$candidate"
+              break
+            fi
+          done < <(find "${CARGO_HOME:-$HOME/.cargo}/git/checkouts" -mindepth 2 -maxdepth 2 -type d)
           if [[ -z "$MESH_ROOT" ]]; then
-            echo "::error::mesh-llm checkout for $SHORT not found after cargo fetch"
+            echo "::error::mesh-llm checkout for $MESH_REV_SHORT not found after cargo fetch"
             exit 1
           fi
           export LLAMA_STAGE_BACKEND=metal
