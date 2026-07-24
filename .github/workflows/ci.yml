@@ -34,7 +34,7 @@ jobs:
       - uses: dorny/paths-filter@7b450fff21473bca461d4b92ce414b9d0420d706 # v4.0.2
         id: filter
         with:
-          token: ''
+          token: ""
           filters: |
             rust:
               - 'crates/**'
@@ -1029,14 +1029,20 @@ jobs:
       - name: Build mesh llama native libraries
         if: steps.llama_cache.outputs.cache-hit != 'true'
         env:
+          MESH_REV: ${{ steps.mesh_rev.outputs.rev }}
           MESH_REV_SHORT: ${{ steps.mesh_rev.outputs.short }}
         run: |
           set -euo pipefail
           cargo fetch --manifest-path desktop/src-tauri/Cargo.toml
-          SHORT="$MESH_REV_SHORT"
-          MESH_ROOT=$(find "${CARGO_HOME:-$HOME/.cargo}/git/checkouts" -path "*/$SHORT" -type d -name "$SHORT" | head -1)
+          MESH_ROOT=""
+          while IFS= read -r candidate; do
+            if [[ "$(git -C "$candidate" rev-parse HEAD 2>/dev/null || true)" == "$MESH_REV" ]]; then
+              MESH_ROOT="$candidate"
+              break
+            fi
+          done < <(find "${CARGO_HOME:-$HOME/.cargo}/git/checkouts" -mindepth 2 -maxdepth 2 -type d)
           if [[ -z "$MESH_ROOT" ]]; then
-            echo "::error::mesh-llm checkout for $SHORT not found after cargo fetch"
+            echo "::error::mesh-llm checkout for $MESH_REV_SHORT not found after cargo fetch"
             exit 1
           fi
           export LLAMA_STAGE_BACKEND=metal
