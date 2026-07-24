@@ -1029,14 +1029,16 @@ jobs:
       - name: Build mesh llama native libraries
         if: steps.llama_cache.outputs.cache-hit != 'true'
         env:
-          MESH_REV_SHORT: ${{ steps.mesh_rev.outputs.short }}
+          MESH_REV: ${{ steps.mesh_rev.outputs.rev }}
         run: |
           set -euo pipefail
-          cargo fetch --manifest-path desktop/src-tauri/Cargo.toml
-          SHORT="$MESH_REV_SHORT"
-          MESH_ROOT=$(find "${CARGO_HOME:-$HOME/.cargo}/git/checkouts" -path "*/$SHORT" -type d -name "$SHORT" | head -1)
-          if [[ -z "$MESH_ROOT" ]]; then
-            echo "::error::mesh-llm checkout for $SHORT not found after cargo fetch"
+          MESH_ROOT="$RUNNER_TEMP/mesh-llm"
+          git init "$MESH_ROOT"
+          git -C "$MESH_ROOT" remote add origin https://github.com/Mesh-LLM/mesh-llm.git
+          git -C "$MESH_ROOT" fetch --depth=1 origin "$MESH_REV"
+          git -C "$MESH_ROOT" checkout --detach FETCH_HEAD
+          if [[ "$(git -C "$MESH_ROOT" rev-parse HEAD)" != "$MESH_REV" ]]; then
+            echo "::error::mesh-llm checkout does not match locked revision $MESH_REV"
             exit 1
           fi
           export LLAMA_STAGE_BACKEND=metal
