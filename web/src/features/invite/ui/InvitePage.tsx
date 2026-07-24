@@ -6,6 +6,11 @@ import {
   detectBuzzDownloadPlatform,
   resolveBuzzDownloadUrlForPlatform,
 } from "@/shared/lib/buzz-download";
+import {
+  type BrowserIdentityStatus,
+  getBrowserIdentityStatus,
+  restoreBrowserIdentityWithPasskey,
+} from "@/shared/lib/browser-identity";
 import { hasDurableBrowserSigner } from "@/shared/lib/nostr-signer";
 import { relayWsUrl } from "@/shared/lib/relay-url";
 import { Button } from "@/shared/ui/button";
@@ -39,6 +44,9 @@ export function InvitePage({ code }: { code: string }) {
   const [browserJoinError, setBrowserJoinError] = React.useState<string | null>(
     null,
   );
+  const [browserIdentity, setBrowserIdentity] =
+    React.useState<BrowserIdentityStatus | null>(null);
+  const [restoringIdentity, setRestoringIdentity] = React.useState(false);
   const [downloadUrl, setDownloadUrl] = React.useState(BUZZ_RELEASES_URL);
   const [needsMacChoice, setNeedsMacChoice] = React.useState(false);
   const [showMacChoice, setShowMacChoice] = React.useState(false);
@@ -60,6 +68,20 @@ export function InvitePage({ code }: { code: string }) {
       const url = await resolveBuzzDownloadUrlForPlatform(platform);
       if (active) setDownloadUrl(url);
     });
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  React.useEffect(() => {
+    let active = true;
+    getBrowserIdentityStatus()
+      .then((status) => {
+        if (active) setBrowserIdentity(status);
+      })
+      .catch(() => {
+        if (active) setBrowserIdentity(null);
+      });
     return () => {
       active = false;
     };
@@ -118,11 +140,29 @@ export function InvitePage({ code }: { code: string }) {
     }
   };
 
+  const restoreIdentity = async () => {
+    setBrowserJoinError(null);
+    setRestoringIdentity(true);
+    try {
+      await restoreBrowserIdentityWithPasskey();
+      setBrowserIdentity(await getBrowserIdentityStatus());
+    } catch (error) {
+      setBrowserJoinError(
+        error instanceof Error
+          ? error.message
+          : "Could not restore this browser identity.",
+      );
+    } finally {
+      setRestoringIdentity(false);
+    }
+  };
+
   const browserSigningAvailable = hasDurableBrowserSigner();
   const disabled =
     policy === undefined ||
     opening ||
     joiningBrowser ||
+    restoringIdentity ||
     Boolean(policy?.age_attestation_required && !ageConfirmed) ||
     Boolean(
       policy &&
@@ -254,12 +294,26 @@ export function InvitePage({ code }: { code: string }) {
                 {browserJoinError}
               </p>
             ) : null}
+            {browserIdentity?.mode === "none" && browserIdentity.recoverable ? (
+              <button
+                className="text-sm font-medium text-black/70 underline-offset-4 hover:text-black hover:underline disabled:cursor-not-allowed disabled:opacity-50"
+                disabled={disabled || restoringIdentity}
+                onClick={restoreIdentity}
+                type="button"
+              >
+                {restoringIdentity
+                  ? "Restoring identity…"
+                  : "Use an existing passkey"}
+              </button>
+            ) : null}
           </div>
         </div>
         <p className="flex h-[3.125rem] items-center justify-center rounded-2xl bg-white text-sm text-black/60">
-          {browserSigningAvailable
-            ? "Your protected browser identity stays on this device."
-            : "Desktop installation is optional. "}
+          {browserSigningAvailable && browserIdentity?.mode === "passkey-prf"
+            ? "Your passkey protects this browser identity across your synced devices."
+            : browserSigningAvailable
+              ? "Your protected browser identity stays on this device."
+              : "Desktop installation is optional. "}
           {!browserSigningAvailable ? (
             <a
               aria-expanded={needsMacChoice ? showMacChoice : undefined}
