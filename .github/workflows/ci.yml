@@ -1032,18 +1032,13 @@ jobs:
           MESH_REV: ${{ steps.mesh_rev.outputs.rev }}
         run: |
           set -euo pipefail
-          cargo fetch --manifest-path desktop/src-tauri/Cargo.toml
-          CHECKOUTS="${CARGO_HOME:-$HOME/.cargo}/git/checkouts"
-          MESH_ROOT=""
-          while IFS= read -r PREPARE_SCRIPT; do
-            CANDIDATE_ROOT=$(dirname "$(dirname "$PREPARE_SCRIPT")")
-            if [[ "$(git -C "$CANDIDATE_ROOT" rev-parse HEAD)" == "$MESH_REV" ]]; then
-              MESH_ROOT="$CANDIDATE_ROOT"
-              break
-            fi
-          done < <(find "$CHECKOUTS" -type f -path "*/scripts/prepare-llama.sh")
-          if [[ -z "$MESH_ROOT" ]]; then
-            echo "::error::mesh-llm checkout for $MESH_REV not found after cargo fetch"
+          MESH_ROOT="$RUNNER_TEMP/mesh-llm"
+          git init "$MESH_ROOT"
+          git -C "$MESH_ROOT" remote add origin https://github.com/Mesh-LLM/mesh-llm.git
+          git -C "$MESH_ROOT" fetch --depth=1 origin "$MESH_REV"
+          git -C "$MESH_ROOT" checkout --detach FETCH_HEAD
+          if [[ "$(git -C "$MESH_ROOT" rev-parse HEAD)" != "$MESH_REV" ]]; then
+            echo "::error::mesh-llm checkout does not match locked revision $MESH_REV"
             exit 1
           fi
           export LLAMA_STAGE_BACKEND=metal
