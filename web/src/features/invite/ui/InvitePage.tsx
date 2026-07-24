@@ -6,7 +6,7 @@ import {
   detectBuzzDownloadPlatform,
   resolveBuzzDownloadUrlForPlatform,
 } from "@/shared/lib/buzz-download";
-import { hasNip07Provider } from "@/shared/lib/nostr-signer";
+import { hasDurableBrowserSigner } from "@/shared/lib/nostr-signer";
 import { relayWsUrl } from "@/shared/lib/relay-url";
 import { Button } from "@/shared/ui/button";
 import * as React from "react";
@@ -118,7 +118,7 @@ export function InvitePage({ code }: { code: string }) {
     }
   };
 
-  const browserSigningAvailable = hasNip07Provider();
+  const browserSigningAvailable = hasDurableBrowserSigner();
   const disabled =
     policy === undefined ||
     opening ||
@@ -257,23 +257,27 @@ export function InvitePage({ code }: { code: string }) {
           </div>
         </div>
         <p className="flex h-[3.125rem] items-center justify-center rounded-2xl bg-white text-sm text-black/60">
-          Don&apos;t have the app?{" "}
-          <a
-            aria-expanded={needsMacChoice ? showMacChoice : undefined}
-            aria-haspopup={needsMacChoice ? "dialog" : undefined}
-            className="ml-1 font-medium text-black underline-offset-4 hover:text-black/70 hover:underline focus-visible:underline"
-            href={downloadUrl}
-            ref={downloadTriggerRef}
-            rel="noreferrer"
-            target="_blank"
-            onClick={(event) => {
-              if (!needsMacChoice) return;
-              event.preventDefault();
-              setShowMacChoice(true);
-            }}
-          >
-            Download it now
-          </a>
+          {browserSigningAvailable
+            ? "Your protected browser identity stays on this device."
+            : "Desktop installation is optional. "}
+          {!browserSigningAvailable ? (
+            <a
+              aria-expanded={needsMacChoice ? showMacChoice : undefined}
+              aria-haspopup={needsMacChoice ? "dialog" : undefined}
+              className="ml-1 font-medium text-black underline-offset-4 hover:text-black/70 hover:underline focus-visible:underline"
+              href={downloadUrl}
+              ref={downloadTriggerRef}
+              rel="noreferrer"
+              target="_blank"
+              onClick={(event) => {
+                if (!needsMacChoice) return;
+                event.preventDefault();
+                setShowMacChoice(true);
+              }}
+            >
+              Download it now
+            </a>
+          ) : null}
         </p>
       </div>
 

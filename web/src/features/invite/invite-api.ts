@@ -21,7 +21,7 @@ export async function claimInviteInBrowser(
   });
   const authorization = await makeNip98AuthHeader(url, "POST", {
     body,
-    requireNip07: true,
+    requireDurableIdentity: true,
   });
   const response = await fetch(url, {
     method: "POST",
