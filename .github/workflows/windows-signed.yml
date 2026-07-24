@@ -1,0 +1,172 @@
+name: Windows signed release
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Git tag or commit to build
+        required: true
+        default: main
+        type: string
+      publish_release:
+        description: Publish the signed installer to a matching GitHub release
+        required: true
+        default: false
+        type: boolean
+
+concurrency:
+  group: windows-signed-${{ inputs.source_ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-sign-verify:
+    name: Build, sign, and verify Windows installer
+    runs-on: windows-latest
+    timeout-minutes: 60
+    environment: production-signing
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    env:
+      TARGET: x86_64-pc-windows-msvc
+    steps:
+      - name: Require a tag for public releases
+        if: inputs.publish_release
+        shell: pwsh
+        env:
+          SOURCE_REF: ${{ inputs.source_ref }}
+        run: |
+          if ($env:SOURCE_REF -notmatch '^v\d+\.\d+\.\d+([-.][0-9A-Za-z.-]+)?$') {
+            throw "Public releases require a version tag such as v0.4.24."
+          }
+
+      - name: Checkout the selected source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ inputs.source_ref }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+        with:
+          targets: ${{ env.TARGET }}
+
+      - name: Set up Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 24.14.1
+          package-manager-cache: false
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4.3.0
+        with:
+          version: 11.4.0
+
+      - name: Install dependencies
+        shell: bash
+        run: pnpm install --frozen-lockfile
+
+      - name: Build sidecars
+        shell: bash
+        run: |
+          cargo build --release --target "$TARGET" -p buzz-acp -p buzz-agent -p buzz-dev-mcp -p git-credential-nostr -p buzz-cli
+          ./scripts/bundle-sidecars.sh "$TARGET"
+
+      - name: Build Windows NSIS installer
+        shell: bash
+        env:
+          CMAKE_POLICY_VERSION_MINIMUM: "3.5"
+        run: pnpm --dir desktop tauri build --verbose --target "$TARGET" --bundles nsis
+
+      - name: Locate unsigned installer
+        id: installer
+        shell: pwsh
+        run: |
+          $bundle = "desktop/src-tauri/target/$env:TARGET/release/bundle/nsis"
+          $installer = Get-ChildItem -LiteralPath $bundle -Filter "*.exe" -File |
+            Select-Object -First 1
+          if (-not $installer) {
+            throw "No NSIS installer found in $bundle."
+          }
+          "path=$($installer.FullName)" >> $env:GITHUB_OUTPUT
+          "name=$($installer.Name)" >> $env:GITHUB_OUTPUT
+
+      - name: Authenticate to Azure with GitHub OIDC
+        uses: azure/login@532459ea530d8321f2fb9bb10d1e0bcf23869a43 # v3
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Sign installer with Microsoft Artifact Signing
+        uses: azure/artifact-signing-action@c7ab2a863ab5f9a846ddb8265964877ef296ee82 # v2
+        with:
+          endpoint: ${{ vars.ARTIFACT_SIGNING_ENDPOINT }}
+          signing-account-name: ${{ vars.ARTIFACT_SIGNING_ACCOUNT }}
+          certificate-profile-name: ${{ vars.ARTIFACT_SIGNING_PROFILE }}
+          files: ${{ steps.installer.outputs.path }}
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+
+      - name: Verify Authenticode and create checksum
+        id: verify
+        shell: pwsh
+        env:
+          INSTALLER_PATH: ${{ steps.installer.outputs.path }}
+        run: |
+          $signature = Get-AuthenticodeSignature -LiteralPath $env:INSTALLER_PATH
+          if ($signature.Status -ne "Valid") {
+            throw "Authenticode validation failed: $($signature.Status) $($signature.StatusMessage)"
+          }
+          if (-not $signature.SignerCertificate.Subject) {
+            throw "The signed installer has no signer certificate subject."
+          }
+          $hash = Get-FileHash -LiteralPath $env:INSTALLER_PATH -Algorithm SHA256
+          $checksumPath = "$env:INSTALLER_PATH.sha256"
+          "$($hash.Hash.ToLowerInvariant())  $(Split-Path $env:INSTALLER_PATH -Leaf)" |
+            Set-Content -LiteralPath $checksumPath -Encoding ascii
+          "checksum=$checksumPath" >> $env:GITHUB_OUTPUT
+          "sha256=$($hash.Hash.ToLowerInvariant())" >> $env:GITHUB_OUTPUT
+          "subject=$($signature.SignerCertificate.Subject)" >> $env:GITHUB_OUTPUT
+
+      - name: Upload verified signed installer
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: buzz-windows-signed-${{ github.run_id }}
+          if-no-files-found: error
+          retention-days: 30
+          path: |
+            ${{ steps.installer.outputs.path }}
+            ${{ steps.verify.outputs.checksum }}
+
+      - name: Publish to the versioned GitHub release
+        if: inputs.publish_release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INSTALLER_PATH: ${{ steps.installer.outputs.path }}
+          CHECKSUM_PATH: ${{ steps.verify.outputs.checksum }}
+          SOURCE_REF: ${{ inputs.source_ref }}
+        run: |
+          gh release view $env:SOURCE_REF --repo $env:GITHUB_REPOSITORY | Out-Null
+          gh release upload $env:SOURCE_REF $env:INSTALLER_PATH $env:CHECKSUM_PATH `
+            --repo $env:GITHUB_REPOSITORY --clobber
+
+      - name: Record signing evidence
+        shell: pwsh
+        env:
+          SHA256: ${{ steps.verify.outputs.sha256 }}
+          SIGNER_SUBJECT: ${{ steps.verify.outputs.subject }}
+          SOURCE_REF: ${{ inputs.source_ref }}
+        run: |
+          @"
+          ### Windows signing evidence
+
+          - Source: ``$env:SOURCE_REF``
+          - SHA-256: ``$env:SHA256``
+          - Authenticode: ``Valid``
+          - Signer: ``$env:SIGNER_SUBJECT``
+          "@ >> $env:GITHUB_STEP_SUMMARY
