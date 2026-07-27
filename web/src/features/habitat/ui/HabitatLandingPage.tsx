@@ -9,8 +9,9 @@ import {
 import buzzAppIcon from "@/assets/app-icon@3x.png";
 
 const CONTROL_CENTER_URL = "https://enter.protecio.com/#/habitat";
-const TEAM_PREVIEW_URL =
-  "https://github.com/Protecio/buzz/releases/tag/protecio-team-preview";
+// GitHub draft releases intentionally use an untagged private URL. Authorized
+// collaborators can reach the current preview from the repository release list.
+const TEAM_PREVIEW_URL = "https://github.com/Protecio/buzz/releases";
 
 export function HabitatLandingPage() {
   return (
