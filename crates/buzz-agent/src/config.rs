@@ -662,16 +662,30 @@ impl Config {
                 env_or("ANTHROPIC_BASE_URL", "https://api.anthropic.com"),
                 OpenAiApi::Auto, // unused for Anthropic
             ),
-            Provider::OpenAi => (
-                req("OPENAI_COMPAT_API_KEY")?,
-                resolve_model(
-                    buzz_agent_model.as_deref(),
-                    env("OPENAI_COMPAT_MODEL").as_deref(),
+            Provider::OpenAi => {
+                let socket_path = env("BUZZ_AGENT_SOCKET_PATH");
+                let base_url = if let Some(ref s) = socket_path {
+                    let clean = s.trim_start_matches("unix://");
+                    format!("unix://{clean}")
+                } else {
+                    env_or("OPENAI_COMPAT_BASE_URL", "https://api.openai.com/v1")
+                };
+                let api_key = if base_url.starts_with("unix://") {
+                    env("OPENAI_COMPAT_API_KEY").unwrap_or_else(|| "sovereign-uds".to_string())
+                } else {
+                    req("OPENAI_COMPAT_API_KEY")?
+                };
+                (
+                    api_key,
+                    resolve_model(
+                        buzz_agent_model.as_deref(),
+                        env("OPENAI_COMPAT_MODEL").as_deref(),
+                    )
+                    .ok_or_else(|| "config: OPENAI_COMPAT_MODEL required".to_string())?,
+                    base_url,
+                    parse_openai_api(env("OPENAI_COMPAT_API").as_deref())?,
                 )
-                .ok_or_else(|| "config: OPENAI_COMPAT_MODEL required".to_string())?,
-                env_or("OPENAI_COMPAT_BASE_URL", "https://api.openai.com/v1"),
-                parse_openai_api(env("OPENAI_COMPAT_API").as_deref())?,
-            ),
+            }
             Provider::Databricks | Provider::DatabricksV2 => (
                 env("DATABRICKS_TOKEN").unwrap_or_default(),
                 resolve_model(buzz_agent_model.as_deref(), databricks_model.as_deref())
