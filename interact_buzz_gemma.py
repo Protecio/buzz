@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 Interactive CLI for Buzz Agent x Gemma 4 via Protecio Sovereign UDS Transport.
-Optimized for high-speed local inference (0.2s - 1.5s) on NVIDIA RTX 5060 GPU.
+Equipped with buzz-dev-mcp for local filesystem, git, and code inspection.
+100% Local, Sovereign, Air-Gapped (NVIDIA RTX 5060 GPU).
 """
 
 import subprocess
@@ -20,18 +21,31 @@ DIM = "\033[2m"
 RESET = "\033[0m"
 
 AGENT_BIN = "/mnt/c/Users/frank/Documents/Protecio Buzz/target/debug/buzz-agent"
+MCP_BIN = "/mnt/c/Users/frank/Documents/Protecio Buzz/target/debug/buzz-dev-mcp"
+DEFAULT_WORKSPACE = "/mnt/c/Users/frank/Documents/Protecio Buzz"
 SOCKET_PATH = "/tmp/protecio.sock"
 
-FAST_SYSTEM_PROMPT = "You are Buzz, a fast sovereign AI assistant powered by Gemma 4. Answer directly, concisely and helpfully. Do not generate internal thinking tokens."
+SOVEREIGN_SYSTEM_PROMPT = (
+    "Tu es Buzz, l'assistant IA souverain de Protecio, propulsé par le grand modèle de langage Gemma 4. "
+    "Tu t'exécutes à 100% EN LOCAL sur la machine de Frank sous Windows 11 / WSL2, directement sur le GPU physique "
+    "NVIDIA GeForce RTX 5060 (8 Go VRAM), via le socket Unix Domain Socket (/tmp/protecio.sock). "
+    "Tu n'es PAS dans le cloud, tu n'es pas hébergé par Google Cloud : aucune donnée, aucun prompt et aucun code ne sort de cet ordinateur. "
+    "Tu as un accès complet à l'environnement local et aux dépôts de code de Frank grâce aux outils intégrés (buzz-dev-mcp) : "
+    "read_file pour lire des fichiers, tree pour explorer l'arborescence, rg pour rechercher du code et shell pour exécuter des commandes. "
+    "Quand Frank te pose des questions sur ses dépôts ou ses fichiers, utilise tes outils ou inspecte directement son espace de travail. "
+    "Réponds toujours en français, de façon concise, directe et professionnelle, sans réflexion interne inutile."
+)
 
 def print_banner():
     banner = f"""{CYAN}╔════════════════════════════════════════════════════════════════════════════╗
-║         🐝  BUZZ AGENT × GEMMA 4 — TRANSPORT SOUVERAIN UDS HAUTE VITESSE    ║
+║         🐝  BUZZ AGENT × GEMMA 4 — ASSISTANT LOCAL SOUVERAIN PROTECIO       ║
 ║                                                                            ║
-║  Transport    : {BOLD}unix://{SOCKET_PATH}{RESET}{CYAN} (Zero-Copy IPC)                     ║
-║  Modèle       : {BOLD}Gemma 4 (NVIDIA RTX 5060 - 8GB VRAM - Débit ~95 tok/s){RESET}{CYAN}       ║
-║  Gouvernance  : {BOLD}Loi 25 PII Shield + Anti-Prompt Injection (Actifs){RESET}{CYAN}           ║
-║  Commandes    : {YELLOW}/stats{RESET}{CYAN}, {YELLOW}/clear{RESET}{CYAN}, {YELLOW}/help{RESET}{CYAN}, {RED}exit{RESET}{CYAN}                                          ║
+║  Exécution    : {BOLD}100% LOCAL (Zéro Cloud / Données Protégées Loi 25){RESET}{CYAN}         ║
+║  Accélération : {BOLD}NVIDIA GeForce RTX 5060 Laptop GPU (8GB VRAM){RESET}{CYAN}               ║
+║  Transport    : {BOLD}unix://{SOCKET_PATH}{RESET}{CYAN} (Zero-Copy IPC - < 1ms)            ║
+║  Outils MCP   : {BOLD}buzz-dev-mcp actif (read_file, rg, tree, shell){RESET}{CYAN}            ║
+║  Workspace    : {DIM}{DEFAULT_WORKSPACE}{RESET}{CYAN}                         ║
+║  Commandes    : {YELLOW}/stats{RESET}{CYAN}, {YELLOW}/clear{RESET}{CYAN}, {YELLOW}/tools{RESET}{CYAN}, {YELLOW}/help{RESET}{CYAN}, {RED}exit{RESET}{CYAN}                                    ║
 ╚════════════════════════════════════════════════════════════════════════════╝{RESET}"""
     print(banner)
 
@@ -79,9 +93,9 @@ class BuzzAgentClient:
         env["BUZZ_AGENT_SOCKET_PATH"] = SOCKET_PATH
         env["OPENAI_COMPAT_MODEL"] = "gemma4"
         env["OPENAI_COMPAT_API_KEY"] = "sovereign"
-        env["BUZZ_AGENT_SYSTEM_PROMPT"] = FAST_SYSTEM_PROMPT
+        env["BUZZ_AGENT_SYSTEM_PROMPT"] = SOVEREIGN_SYSTEM_PROMPT
 
-        print(f"{YELLOW}⏳ Démarrage et pré-chauffage de buzz-agent...{RESET}")
+        print(f"{YELLOW}⏳ Démarrage de buzz-agent avec buzz-dev-mcp...{RESET}")
         self.proc = subprocess.Popen(
             [AGENT_BIN],
             stdin=subprocess.PIPE,
@@ -98,9 +112,9 @@ class BuzzAgentClient:
         agent_name = init_res.get("result", {}).get("agentInfo", {}).get("name", "buzz-agent")
         agent_version = init_res.get("result", {}).get("agentInfo", {}).get("version", "0.1.0")
 
-        # 2. Session new
+        # 2. Session new avec outillage MCP local
         self.new_session()
-        print(f"{GREEN}✔ Buzz-Agent ({agent_name} v{agent_version}) prêt sur UDS (VRAM chaude) !{RESET}\n")
+        print(f"{GREEN}✔ Buzz-Agent ({agent_name} v{agent_version}) connecté en Local Souverain avec outillage MCP !{RESET}\n")
 
     def next_id(self):
         i = self.req_id
@@ -120,7 +134,25 @@ class BuzzAgentClient:
         return json.loads(line.strip())
 
     def new_session(self):
-        self.send({"jsonrpc": "2.0", "id": self.next_id(), "method": "session/new", "params": {"cwd": "/tmp", "mcpServers": []}})
+        mcp_servers = []
+        if os.path.exists(MCP_BIN):
+            mcp_servers.append({
+                "name": "dev",
+                "command": MCP_BIN,
+                "args": [],
+                "env": []
+            })
+
+        self.send({
+            "jsonrpc": "2.0",
+            "id": self.next_id(),
+            "method": "session/new",
+            "params": {
+                "cwd": DEFAULT_WORKSPACE,
+                "systemPrompt": SOVEREIGN_SYSTEM_PROMPT,
+                "mcpServers": mcp_servers
+            }
+        })
         res = self.read_response()
         self.session_id = res.get("result", {}).get("sessionId")
         return self.session_id
@@ -142,6 +174,7 @@ class BuzzAgentClient:
 
         chunks = []
         tokens_info = None
+        tool_activity = []
 
         while True:
             msg = self.read_response()
@@ -151,9 +184,17 @@ class BuzzAgentClient:
             method = msg.get("method")
             if method == "session/update":
                 update = msg.get("params", {}).get("update", {})
-                if update.get("sessionUpdate") == "agent_message_chunk":
+                update_type = update.get("sessionUpdate")
+
+                if update_type == "agent_message_chunk":
                     chunk_text = update.get("content", {}).get("text", "")
                     chunks.append(chunk_text)
+                elif update_type == "tool_call":
+                    tool_name = update.get("title", update.get("rawInput", {}).get("name", "outil"))
+                    tool_activity.append(f"Appel outil : {tool_name}")
+                elif update_type == "tool_call_update" and update.get("status") == "completed":
+                    tool_activity.append("Outil exécuté avec succès.")
+
             elif method == "_goose/unstable/session/update":
                 update = msg.get("params", {}).get("update", {})
                 if update.get("sessionUpdate") == "usage_update":
@@ -164,9 +205,12 @@ class BuzzAgentClient:
 
         spinner.stop()
 
-        # Display answer
+        if tool_activity:
+            for act in tool_activity:
+                print(f"{DIM}🔧 [{act}]{RESET}")
+
         response_body = "".join(chunks)
-        print(f"{CYAN}{BOLD}Buzz (Gemma 4 via UDS) :{RESET}\n{response_body.strip()}\n")
+        print(f"{CYAN}{BOLD}Buzz (Gemma 4 Local) :{RESET}\n{response_body.strip()}\n")
 
         if tokens_info:
             out_tok = tokens_info.get("accumulatedOutputTokens", 0)
@@ -227,13 +271,21 @@ def main():
             elif cmd == "/stats":
                 fetch_gateway_stats()
                 continue
+            elif cmd == "/tools":
+                print(f"\n{CYAN}=== Outils MCP Locaux Actifs (buzz-dev-mcp) ==={RESET}")
+                print(f"- {BOLD}read_file{RESET}   : Lecture de fichiers locaux dans l'espace de travail")
+                print(f"- {BOLD}tree{RESET}        : Exploration des répertoires et arborescence de fichiers")
+                print(f"- {BOLD}rg{RESET}          : Recherche ripgrep dans tout le code local")
+                print(f"- {BOLD}str_replace{RESET} : Édition et remplacement de texte dans les fichiers")
+                print(f"- {BOLD}shell{RESET}       : Exécution de commandes bash dans le workspace\n")
+                continue
             elif cmd == "/clear":
                 client.new_session()
                 print(f"{GREEN}Nouvelle session Buzz créée. Historique réinitialisé.{RESET}")
                 continue
             elif cmd == "/help":
-                print(f"{CYAN}Tapez vos questions pour dialoguer en local avec Gemma 4 via UDS.{RESET}")
-                print(f"{CYAN}Commandes : /stats, /clear, /help, exit{RESET}")
+                print(f"{CYAN}Tapez vos questions ou instructions (ex: 'Quel est le contenu de Cargo.toml ?').{RESET}")
+                print(f"{CYAN}Commandes : /stats, /tools, /clear, /help, exit{RESET}")
                 continue
 
             start_t = time.time()
