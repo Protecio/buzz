@@ -318,6 +318,88 @@ impl Llm {
         )
     }
 
+#[cfg(unix)]
+async fn post_unix_socket(
+    socket_path: &str,
+    path: &str,
+    body: &Value,
+    bearer: &str,
+) -> Result<Value, AgentError> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::UnixStream;
+
+    let mut stream = UnixStream::connect(socket_path)
+        .await
+        .map_err(|e| AgentError::Llm(format!("uds connect {socket_path}: {e}")))?;
+
+    let body_bytes = serde_json::to_vec(body)
+        .map_err(|e| AgentError::Llm(format!("serialize: {e}")))?;
+
+    let auth_header = if !bearer.is_empty() && bearer != "none" {
+        format!("Authorization: Bearer {bearer}\r\n")
+    } else {
+        String::new()
+    };
+
+    let req = format!(
+        "POST {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n{auth_header}\r\n",
+        body_bytes.len()
+    );
+
+    stream
+        .write_all(req.as_bytes())
+        .await
+        .map_err(|e| AgentError::Llm(format!("uds write header: {e}")))?;
+    stream
+        .write_all(&body_bytes)
+        .await
+        .map_err(|e| AgentError::Llm(format!("uds write body: {e}")))?;
+
+    let mut resp_bytes = Vec::new();
+    stream
+        .read_to_end(&mut resp_bytes)
+        .await
+        .map_err(|e| AgentError::Llm(format!("uds read response: {e}")))?;
+
+    let resp_str = String::from_utf8_lossy(&resp_bytes);
+    if let Some(pos) = resp_str.find("\r\n\r\n") {
+        let header_part = &resp_str[..pos];
+        let body_part = &resp_str[pos + 4..];
+
+        if let Some(first_line) = header_part.lines().next() {
+            let parts: Vec<&str> = first_line.split_whitespace().collect();
+            if parts.len() >= 2 {
+                let status_code: u16 = parts[1].parse().unwrap_or(200);
+                if status_code == 401 || status_code == 403 {
+                    return Err(AgentError::LlmAuth(body_part.to_string()));
+                }
+                if status_code >= 400 {
+                    return Err(AgentError::Llm(format!(
+                        "uds http {status_code}: {body_part}"
+                    )));
+                }
+            }
+        }
+
+        serde_json::from_str(body_part)
+            .map_err(|e| AgentError::Llm(format!("uds json parse error: {e}, payload: {body_part}")))
+    } else {
+        Err(AgentError::Llm("uds malformed http response".into()))
+    }
+}
+
+#[cfg(not(unix))]
+async fn post_unix_socket(
+    _socket_path: &str,
+    _path: &str,
+    _body: &Value,
+    _bearer: &str,
+) -> Result<Value, AgentError> {
+    Err(AgentError::Llm(
+        "Unix domain socket transport is currently supported on Unix platforms".into(),
+    ))
+}
+
     /// POST to an OpenAI-family endpoint. For OpenAI-compat this is just
     /// `{base_url}{path}` with the body untouched. For Databricks the URL
     /// becomes `{base_url}/serving-endpoints/{model}/invocations` and the
@@ -330,6 +412,12 @@ impl Llm {
         body: &Value,
         effective_model: &str,
     ) -> Result<Value, AgentError> {
+        if cfg.base_url.starts_with("unix://") {
+            let socket_path = cfg.base_url.trim_start_matches("unix://");
+            let bearer = self.auth.bearer().await.unwrap_or_default();
+            return Self::post_unix_socket(socket_path, path, body, &bearer).await;
+        }
+
         let (url, body_owned);
         let body_ref: &Value = match cfg.provider {
             Provider::Databricks => {
