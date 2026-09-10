@@ -1,3 +1,7 @@
+import {
+  agentPresenceStartBlockReason,
+  type AgentAvailabilityReader,
+} from "@/features/agents/lib/useAgentAvailability";
 import * as React from "react";
 import { useQueryClient } from "@tanstack/react-query";
 
@@ -11,7 +15,10 @@ import {
   startManagedAgentWithRules,
   stopManagedAgentWithRules,
 } from "@/features/agents/lib/managedAgentControlActions";
-import { useManagedAgentRuntimeAction } from "@/features/agents/managedAgentRuntimeHooks";
+import {
+  clearActiveTurnsForAgentOnStop,
+  useManagedAgentRuntimeAction,
+} from "@/features/agents/managedAgentRuntimeHooks";
 import { managedAgentPairAction } from "@/features/agents/managedAgentRuntimeStatus";
 import {
   channelsQueryKey,
@@ -26,6 +33,7 @@ import type {
 
 type UseMembersSidebarActionsOptions = {
   channelId: string | null;
+  getAvailability: AgentAvailabilityReader;
   controllableManagedBots: readonly ManagedAgent[];
   removableManagedBots: readonly ManagedAgent[];
   currentPubkey?: string;
@@ -46,6 +54,7 @@ const EMPTY_AGENT_CONTEXT = {
 
 export function useMembersSidebarActions({
   channelId,
+  getAvailability,
   controllableManagedBots,
   removableManagedBots,
   currentPubkey,
@@ -53,6 +62,16 @@ export function useMembersSidebarActions({
   relayUrl,
 }: UseMembersSidebarActionsOptions) {
   const queryClient = useQueryClient();
+  function assertStartNotBlockedByPresence(
+    agent: ManagedAgent,
+    lifecycleActive: boolean,
+  ) {
+    const reason = agentPresenceStartBlockReason(
+      lifecycleActive,
+      getAvailability(agent.pubkey),
+    );
+    if (reason) throw new Error(reason);
+  }
   const removeMemberMutation = useRemoveChannelMemberMutation(channelId);
   const startManagedAgentMutation = useStartManagedAgentMutation();
   const stopManagedAgentMutation = useStopManagedAgentMutation();
@@ -152,6 +171,7 @@ export function useMembersSidebarActions({
       // agent-wide deploy/!shutdown flow below.
       if (agent.backend.type === "local" && relayUrl) {
         const action = managedAgentPairAction(runtime);
+        assertStartNotBlockedByPresence(agent, action === "stop");
         await runtimeActionMutation.mutateAsync({
           action,
           pubkey: agent.pubkey,
@@ -174,6 +194,9 @@ export function useMembersSidebarActions({
           preferredChannelId: channelId,
           stopManagedAgent: stopManagedAgentMutation.mutateAsync,
         });
+        if (agent.backend.type === "local") {
+          clearActiveTurnsForAgentOnStop(agent.pubkey);
+        }
         setActionNoticeMessage(
           agent.backend.type === "provider"
             ? `Shutdown command sent to ${agent.name}.`
@@ -182,6 +205,7 @@ export function useMembersSidebarActions({
         return;
       }
 
+      assertStartNotBlockedByPresence(agent, false);
       await startManagedAgentWithRules({
         agent,
         startManagedAgent: startManagedAgentMutation.mutateAsync,
@@ -199,10 +223,12 @@ export function useMembersSidebarActions({
   async function handleRespawnAll() {
     await runBulkAgentAction({
       action: async (agent) => {
+        assertStartNotBlockedByPresence(agent, isManagedAgentActive(agent));
         await respawnManagedAgentWithRules({
           agent,
           startManagedAgent: startManagedAgentMutation.mutateAsync,
           stopManagedAgent: stopManagedAgentMutation.mutateAsync,
+          onStopped: () => clearActiveTurnsForAgentOnStop(agent.pubkey),
         });
         return undefined;
       },
@@ -216,13 +242,18 @@ export function useMembersSidebarActions({
 
   async function handleStopAll() {
     await runBulkAgentAction({
-      action: (agent) =>
-        stopManagedAgentWithRules({
+      action: async (agent) => {
+        const result = await stopManagedAgentWithRules({
           agent,
           ...EMPTY_AGENT_CONTEXT,
           preferredChannelId: channelId,
           stopManagedAgent: stopManagedAgentMutation.mutateAsync,
-        }),
+        });
+        if (agent.backend.type === "local") {
+          clearActiveTurnsForAgentOnStop(agent.pubkey);
+        }
+        return result;
+      },
       actionKey: "bulk-stop",
       agents: stoppableManagedBots,
       failureMessage: "Failed to stop agent.",

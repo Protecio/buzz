@@ -123,6 +123,12 @@ test("invite requires age and legal consent before opening Buzz", async ({
 test("invite can enroll a durable local identity for browser access", async ({
   page,
 }) => {
+  await page.addInitScript(() => {
+    Object.defineProperty(window, "PublicKeyCredential", {
+      configurable: true,
+      value: undefined,
+    });
+  });
   await page.route("**/api/join-policy", async (route) => {
     await route.fulfill({
       status: 200,
@@ -176,6 +182,187 @@ test("invite can enroll a durable local identity for browser access", async ({
   await expect(page).toHaveURL("/");
   expect(claimedPubkeys).toHaveLength(2);
   expect(claimedPubkeys[1]).toBe(claimedPubkeys[0]);
+});
+
+test("invite derives a recoverable identity from a passkey without storing its secret", async ({
+  page,
+}) => {
+  await page.addInitScript(() => {
+    const credentialId = new Uint8Array([80, 82, 79, 84, 69, 67, 73, 79]);
+    const prfResult = new Uint8Array(32).fill(17);
+    const MockPublicKeyCredential = function MockPublicKeyCredential() {};
+    Object.defineProperty(MockPublicKeyCredential, "getClientCapabilities", {
+      value: async () => ({ "extension:prf": true }),
+    });
+    const credential = () => ({
+      rawId: credentialId.slice().buffer,
+      getClientExtensionResults: () => ({
+        prf: {
+          enabled: true,
+          results: { first: prfResult.slice().buffer },
+        },
+      }),
+    });
+    Object.defineProperty(window, "PublicKeyCredential", {
+      configurable: true,
+      value: MockPublicKeyCredential,
+    });
+    Object.defineProperty(navigator, "credentials", {
+      configurable: true,
+      value: {
+        create: async () => credential(),
+        get: async () => credential(),
+      },
+    });
+  });
+  await page.route("**/api/join-policy", async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ policy: null }),
+    });
+  });
+
+  const claimedPubkeys: string[] = [];
+  await page.route("**/api/invites/claim", async (route) => {
+    const authorization = route.request().headers().authorization;
+    expect(authorization).toMatch(/^Nostr /);
+    const event = JSON.parse(
+      Buffer.from(authorization.slice("Nostr ".length), "base64").toString(
+        "utf8",
+      ),
+    ) as { pubkey: string };
+    claimedPubkeys.push(event.pubkey);
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        status: "joined",
+        community_id: "community-id",
+        host: "127.0.0.1",
+        role: "member",
+      }),
+    });
+  });
+
+  await page.goto("/invite/passkey-code");
+  await page.getByRole("button", { name: "Join in browser" }).click();
+  await expect(page).toHaveURL("/");
+  await page.goto("/invite/passkey-code-after-reload");
+  await expect(
+    page.getByText(
+      "Your passkey protects this browser identity across your synced devices.",
+    ),
+  ).toBeVisible();
+  await page.getByRole("button", { name: "Join in browser" }).click();
+  await expect(page).toHaveURL("/");
+
+  await page.evaluate(
+    () =>
+      new Promise<void>((resolve, reject) => {
+        const request = indexedDB.deleteDatabase("buzz-browser-identity-v1");
+        request.onsuccess = () => resolve();
+        request.onerror = () => reject(request.error);
+      }),
+  );
+  await page.goto("/invite/passkey-code-on-new-device");
+  await page.getByRole("button", { name: "Use an existing passkey" }).click();
+  await expect(
+    page.getByText(
+      "Your passkey protects this browser identity across your synced devices.",
+    ),
+  ).toBeVisible();
+  await page.getByRole("button", { name: "Join in browser" }).click();
+  await expect(page).toHaveURL("/");
+
+  expect(claimedPubkeys).toHaveLength(3);
+  expect(claimedPubkeys[1]).toBe(claimedPubkeys[0]);
+  expect(claimedPubkeys[2]).toBe(claimedPubkeys[0]);
+  const storedRecordIds = await page.evaluate(
+    () =>
+      new Promise<string[]>((resolve, reject) => {
+        const request = indexedDB.open("buzz-browser-identity-v1", 2);
+        request.onsuccess = () => {
+          const database = request.result;
+          const transaction = database.transaction("identity", "readonly");
+          const records = transaction.objectStore("identity").getAll();
+          records.onsuccess = () => {
+            database.close();
+            resolve(
+              (records.result as Array<{ id: string }>).map(
+                (record) => record.id,
+              ),
+            );
+          };
+          records.onerror = () => reject(records.error);
+        };
+        request.onerror = () => reject(request.error);
+      }),
+  );
+  expect(storedRecordIds).toEqual(["identity-metadata-v2"]);
+});
+
+test("invite does not silently downgrade when passkey verification is cancelled", async ({
+  page,
+}) => {
+  await page.addInitScript(() => {
+    const MockPublicKeyCredential = function MockPublicKeyCredential() {};
+    Object.defineProperty(MockPublicKeyCredential, "getClientCapabilities", {
+      value: async () => ({ "extension:prf": true }),
+    });
+    Object.defineProperty(window, "PublicKeyCredential", {
+      configurable: true,
+      value: MockPublicKeyCredential,
+    });
+    Object.defineProperty(navigator, "credentials", {
+      configurable: true,
+      value: {
+        create: async () => {
+          throw new DOMException("Cancelled", "NotAllowedError");
+        },
+        get: async () => {
+          throw new DOMException("Cancelled", "NotAllowedError");
+        },
+      },
+    });
+  });
+  await page.route("**/api/join-policy", async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ policy: null }),
+    });
+  });
+
+  await page.goto("/invite/passkey-cancelled");
+  await page.getByRole("button", { name: "Join in browser" }).click();
+  await expect(
+    page.getByRole("alert").getByText("Passkey verification was cancelled."),
+  ).toBeVisible();
+  const databaseNames = await page.evaluate(async () =>
+    (await indexedDB.databases()).map((database) => database.name),
+  );
+  expect(databaseNames).toContain("buzz-browser-identity-v1");
+  const storedRecords = await page.evaluate(
+    () =>
+      new Promise<number>((resolve, reject) => {
+        const request = indexedDB.open("buzz-browser-identity-v1", 2);
+        request.onsuccess = () => {
+          const database = request.result;
+          const count = database
+            .transaction("identity", "readonly")
+            .objectStore("identity")
+            .count();
+          count.onsuccess = () => {
+            database.close();
+            resolve(count.result);
+          };
+          count.onerror = () => reject(count.error);
+        };
+        request.onerror = () => reject(request.error);
+      }),
+  );
+  expect(storedRecords).toBe(0);
 });
 
 test("invite stays browser-first on Safari-compatible devices", async ({

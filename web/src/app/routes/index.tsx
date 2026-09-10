@@ -1,6 +1,6 @@
 import { createFileRoute } from "@tanstack/react-router";
-import { ReposPage } from "@/features/repos/ui/ReposPage";
+import { HabitatLandingPage } from "@/features/habitat/ui/HabitatLandingPage";
 
 export const Route = createFileRoute("/")({
-  component: ReposPage,
+  component: HabitatLandingPage,
 });

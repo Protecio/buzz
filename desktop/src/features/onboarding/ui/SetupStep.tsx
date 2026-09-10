@@ -1,13 +1,14 @@
 import * as React from "react";
 import { openUrl } from "@tauri-apps/plugin-opener";
-import { Check } from "lucide-react";
+import { Check, Info } from "lucide-react";
 
 import {
   useAcpAuthMethodsQuery,
-  useAcpRuntimesQuery,
+  useAcpRuntimesQueryForced,
   useConnectAcpRuntimeMutation,
   useInstallAcpRuntimeMutation,
 } from "@/features/agents/hooks";
+import { useInstallOutputLine } from "@/features/agents/lib/useInstallOutputLine";
 import { describeResolvedCommand } from "@/features/agents/ui/agentUi";
 import type { AcpAuthMethod, AcpRuntimeCatalogEntry } from "@/shared/api/types";
 import { getInstallErrorMessage } from "@/shared/lib/installError";
@@ -50,9 +51,9 @@ type InstallResultState = {
 type InstallResultsState = Record<string, InstallResultState>;
 
 function useSetupStepState(): SetupStepState {
-  const runtimesQuery = useAcpRuntimesQuery();
+  const runtimesQuery = useAcpRuntimesQueryForced();
   const items = runtimesQuery.data ?? [];
-  const isChecking = runtimesQuery.isLoading;
+  const isChecking = runtimesQuery.isFetching;
   const errorMessage =
     runtimesQuery.error instanceof Error ? runtimesQuery.error.message : null;
 
@@ -108,7 +109,11 @@ function RuntimeStatus({
       runtime.authStatus.status === "logged_out",
   });
   const connectMutation = useConnectAcpRuntimeMutation();
-  const runtimesQuery = useAcpRuntimesQuery();
+  // Child rows share the surface owner's forced query state + refresh callback
+  // (`useSetupStepState` owns the single force-on-mount). Each row must not
+  // mount its own force effect, or onboarding entry re-runs discovery once per
+  // row instead of once for the surface.
+  const runtimesQuery = useAcpRuntimesQueryForced({ forceOnMount: false });
   const [isWaitingForSignIn, setIsWaitingForSignIn] = React.useState(false);
   const [didSignInCheckTimeOut, setDidSignInCheckTimeOut] =
     React.useState(false);
@@ -124,7 +129,7 @@ function RuntimeStatus({
     if (!isWaitingForSignIn) return;
 
     const interval = window.setInterval(() => {
-      void runtimesQuery.refetch();
+      void runtimesQuery.forceRefresh();
     }, 2_000);
     const timeout = window.setTimeout(() => {
       setIsWaitingForSignIn(false);
@@ -135,7 +140,7 @@ function RuntimeStatus({
       window.clearInterval(interval);
       window.clearTimeout(timeout);
     };
-  }, [isWaitingForSignIn, runtimesQuery.refetch]);
+  }, [isWaitingForSignIn, runtimesQuery.forceRefresh]);
   const authMethods = getOnboardingAuthMethods(
     runtime,
     methodsQuery.data?.methods ?? [],
@@ -156,7 +161,7 @@ function RuntimeStatus({
             if (didSignInCheckTimeOut) {
               setDidSignInCheckTimeOut(false);
               setIsWaitingForSignIn(true);
-              void runtimesQuery.refetch();
+              void runtimesQuery.forceRefresh();
               return;
             }
             if (!authMethod) {
@@ -214,6 +219,40 @@ function RuntimeStatus({
   }
 
   if (runtimeIsReadyForOnboarding(runtime)) {
+    // Cached readiness must not read as freshly confirmed while a warm forced
+    // probe is revalidating (or has rejected) over it. `runtimesQuery` shares
+    // the surface owner's forced-query state, so its fetching/error flags track
+    // the in-flight recheck. Pending → a visible CHECKING… state; a warm
+    // rejection → a recheck affordance (never an unqualified READY). On success
+    // both clear and READY returns. Next stays gated by isChecking/errorMessage
+    // in SetupStepContent, so this only governs the per-card claim.
+    if (runtimesQuery.isFetching) {
+      return (
+        <div
+          aria-label={`Rechecking ${runtime.label}`}
+          className="flex h-5 items-center gap-2 rounded-full bg-[#EBEFEF] px-2.5 font-mono text-badge font-normal uppercase text-foreground"
+          data-testid={`onboarding-runtime-rechecking-${runtime.id}`}
+          role="status"
+        >
+          <Spinner className="h-3 w-3 border-2 text-foreground" />
+          CHECKING…
+        </div>
+      );
+    }
+    if (runtimesQuery.isError) {
+      return (
+        <Button
+          aria-label={`Check ${runtime.label} again`}
+          className="buzz-onboarding-runtime-setup h-5 rounded-full bg-[var(--buzz-welcome-chartreuse)]/30 px-2.5 font-mono !text-badge font-normal uppercase text-foreground hover:bg-[var(--buzz-welcome-chartreuse)]/40"
+          data-testid={`onboarding-runtime-recheck-${runtime.id}`}
+          onClick={() => void runtimesQuery.forceRefresh()}
+          type="button"
+          variant="ghost"
+        >
+          CHECK AGAIN
+        </Button>
+      );
+    }
     return (
       <Tooltip>
         <TooltipTrigger asChild>
@@ -243,7 +282,7 @@ function RuntimeStatus({
         aria-label={`Check ${runtime.label} again`}
         className="buzz-onboarding-runtime-setup h-5 rounded-full bg-[var(--buzz-welcome-chartreuse)]/30 px-2.5 font-mono !text-badge font-normal uppercase text-foreground hover:bg-[var(--buzz-welcome-chartreuse)]/40"
         disabled={runtimesQuery.isFetching}
-        onClick={() => void runtimesQuery.refetch()}
+        onClick={() => void runtimesQuery.forceRefresh()}
         type="button"
         variant="ghost"
       >
@@ -384,8 +423,11 @@ function runtimeDetailText(runtime: AcpRuntimeCatalogEntry): string {
   if (runtime.availability === "adapter_outdated") {
     return "ACP adapter detected but outdated — reinstall required.";
   }
-  if (runtime.availability === "cli_missing") {
-    return "ACP adapter detected; CLI missing.";
+  if (
+    runtime.availability === "cli_missing" ||
+    runtime.availability === "not_installed"
+  ) {
+    return "CLI not detected.";
   }
   return "";
 }
@@ -463,18 +505,56 @@ function RuntimeAuthError({ runtime }: { runtime: AcpRuntimeCatalogEntry }) {
 }
 
 function RuntimeCard({
-  installError,
-  isInstalling,
-  onInstall,
+  installResults,
+  onInstallResultsChange,
   runtime,
 }: {
-  installError: string | null;
-  isInstalling: boolean;
-  onInstall: () => void;
+  installResults: InstallResultsState;
+  onInstallResultsChange: React.Dispatch<
+    React.SetStateAction<InstallResultsState>
+  >;
   runtime: AcpRuntimeCatalogEntry;
 }) {
+  // Each card owns its own mutation instance so concurrent installs on
+  // different cards each track their own isPending state and callbacks
+  // independently (react-query v5 per-mutate callbacks only fire for the
+  // latest mutate() call on a shared instance, silently dropping earlier ones).
+  const installMutation = useInstallAcpRuntimeMutation();
+  const installError = installResults[runtime.id]?.error ?? null;
+  const isInstalling = installMutation.isPending;
+  const installOutputLine = useInstallOutputLine(runtime.id, isInstalling);
   const isAvailable = runtime.availability === "available";
   const isReady = runtimeIsReadyForOnboarding(runtime);
+
+  function handleInstall() {
+    onInstallResultsChange((current) => ({
+      ...current,
+      [runtime.id]: { error: null, success: false },
+    }));
+
+    installMutation.mutate(runtime.id, {
+      onSuccess: (result) => {
+        onInstallResultsChange((current) => ({
+          ...current,
+          [runtime.id]: result.success
+            ? { error: null, success: true }
+            : {
+                error: getInstallErrorMessage(result),
+                success: false,
+              },
+        }));
+      },
+      onError: (error) => {
+        onInstallResultsChange((current) => ({
+          ...current,
+          [runtime.id]: {
+            error: error instanceof Error ? error.message : "Install failed.",
+            success: false,
+          },
+        }));
+      },
+    });
+  }
 
   return (
     <Card
@@ -499,10 +579,21 @@ function RuntimeCard({
         <RuntimeStatus
           installError={installError}
           isInstalling={isInstalling}
-          onInstall={onInstall}
+          onInstall={handleInstall}
           runtime={runtime}
         />
-        {!isAvailable && runtimeDetailText(runtime) ? (
+        {isInstalling && installOutputLine ? (
+          // Takes the detail text's slot rather than adding a row: the card is
+          // fixed-height, and during an install the live line is the more
+          // useful of the two.
+          <p
+            aria-live="polite"
+            className="max-w-[13rem] truncate font-mono text-2xs leading-4 text-muted-foreground"
+            data-testid={`onboarding-runtime-install-output-${runtime.id}`}
+          >
+            {installOutputLine}
+          </p>
+        ) : !isAvailable && runtimeDetailText(runtime) ? (
           <p
             aria-hidden={installError ? "true" : undefined}
             className={cn(
@@ -517,7 +608,7 @@ function RuntimeCard({
       {installError ? (
         <RuntimeErrorTooltip
           className="absolute inset-x-3 bottom-2 flex min-w-0 items-center justify-center gap-1.5 overflow-hidden whitespace-nowrap text-xs leading-4 text-destructive"
-          detail="Installation couldn’t be completed. Try again."
+          detail={installError}
           label="Installation failed"
           showIcon
           testId={`onboarding-runtime-error-${runtime.id}`}
@@ -549,10 +640,12 @@ function RuntimeProvidersLoadingState() {
 
 function RuntimeProvidersSection({
   installResults,
+  navigateToAgentSettings,
   onInstallResultsChange,
   runtimeProviders,
 }: {
   installResults: InstallResultsState;
+  navigateToAgentSettings?: () => void;
   onInstallResultsChange: React.Dispatch<
     React.SetStateAction<InstallResultsState>
   >;
@@ -560,34 +653,6 @@ function RuntimeProvidersSection({
 }) {
   const { errorMessage, isChecking, items } = runtimeProviders;
   const orderedItems = getVisibleOnboardingRuntimes(items);
-  const installMutation = useInstallAcpRuntimeMutation();
-
-  function handleInstall(runtimeId: string) {
-    onInstallResultsChange((current) => ({
-      ...current,
-      [runtimeId]: { error: null, success: false },
-    }));
-
-    installMutation.mutate(runtimeId, {
-      onSuccess: (result) => {
-        onInstallResultsChange((current) => ({
-          ...current,
-          [runtimeId]: result.success
-            ? { error: null, success: true }
-            : { error: getInstallErrorMessage(result.steps), success: false },
-        }));
-      },
-      onError: (error) => {
-        onInstallResultsChange((current) => ({
-          ...current,
-          [runtimeId]: {
-            error: error instanceof Error ? error.message : "Install failed.",
-            success: false,
-          },
-        }));
-      },
-    });
-  }
 
   return (
     <section className="flex min-h-full w-full flex-col items-center">
@@ -596,23 +661,19 @@ function RuntimeProvidersSection({
           Set up your agent harnesses
         </h1>
         <p className="mx-auto mt-3 max-w-[760px] text-sm leading-6 text-foreground/90">
-          Buzz detected the harnesses available on this machine. Install or sign
-          in to at least one to continue.
+          Buzz checks for command-line harnesses on this machine. Install the
+          CLI or sign in to at least one to continue.
         </p>
       </div>
 
       <div className="flex w-full flex-1 flex-col items-center justify-center gap-8 py-10">
         {orderedItems.length > 0 ? (
-          <div className="grid min-w-0 w-full max-w-[592px] grid-cols-1 gap-4 md:grid-cols-2">
+          <div className="grid min-w-0 w-full max-w-[1200px] grid-cols-1 gap-4 md:grid-cols-2 lg:grid-cols-4">
             {orderedItems.map((runtime) => (
               <RuntimeCard
-                installError={installResults[runtime.id]?.error ?? null}
-                isInstalling={
-                  installMutation.isPending &&
-                  installMutation.variables === runtime.id
-                }
+                installResults={installResults}
                 key={runtime.id}
-                onInstall={() => handleInstall(runtime.id)}
+                onInstallResultsChange={onInstallResultsChange}
                 runtime={runtime}
               />
             ))}
@@ -624,16 +685,39 @@ function RuntimeProvidersSection({
             className="max-w-[560px] rounded-2xl bg-white/70 px-6 py-6 text-sm text-muted-foreground"
             data-testid="onboarding-acp-empty"
           >
-            No supported agent harnesses were detected yet. Install Claude Code
-            or Codex, then check again.
+            No supported command-line harnesses were detected yet. Install a
+            supported CLI, then check again.
           </p>
         )}
 
         {errorMessage ? (
-          <p className="max-w-[560px] rounded-2xl bg-destructive/10 px-6 py-3 text-sm text-destructive">
+          <p
+            className="max-w-[560px] rounded-2xl bg-destructive/10 px-6 py-3 text-sm text-destructive"
+            data-testid="onboarding-setup-error"
+          >
             {errorMessage}
           </p>
         ) : null}
+
+        <p className="mx-auto flex max-w-[440px] items-start justify-center gap-1.5 text-center text-xs leading-5 text-[var(--buzz-onboarding-backup-ink)]">
+          <Info aria-hidden className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+          <span>
+            More harnesses (Cursor, Grok, Amp&hellip;){" "}
+            {navigateToAgentSettings ? (
+              <button
+                className="underline underline-offset-2 hover:text-foreground"
+                data-testid="onboarding-setup-more-harnesses"
+                onClick={navigateToAgentSettings}
+                type="button"
+              >
+                Settings → Agents
+              </button>
+            ) : (
+              <span>Settings → Agents</span>
+            )}{" "}
+            after setup.
+          </span>
+        </p>
       </div>
     </section>
   );
@@ -672,6 +756,7 @@ function SetupStepContent({
     >
       <RuntimeProvidersSection
         installResults={installResults}
+        navigateToAgentSettings={actions.navigateToAgentSettings}
         onInstallResultsChange={setInstallResults}
         runtimeProviders={runtimeProviders}
       />
@@ -680,31 +765,24 @@ function SetupStepContent({
         <Button
           className={`${ONBOARDING_PRIMARY_CTA_CLASS} text-sm`}
           data-testid="onboarding-setup-next"
-          disabled={readyRuntimeIds.length === 0}
+          disabled={
+            readyRuntimeIds.length === 0 ||
+            runtimeProviders.isChecking ||
+            !!runtimeProviders.errorMessage
+          }
           onClick={() => actions.next(readyRuntimeIds)}
           type="button"
         >
           Next
         </Button>
-
         <Button
-          className="h-9 rounded-full bg-foreground/10 px-6 text-sm hover:bg-foreground/15"
+          className="h-9 whitespace-nowrap rounded-full px-6 text-sm hover:bg-foreground/10"
           data-testid="onboarding-setup-skip"
           onClick={() => actions.next([])}
           type="button"
           variant="ghost"
         >
           Skip for now
-        </Button>
-
-        <Button
-          className="h-9 rounded-full bg-foreground/10 px-6 text-sm hover:bg-foreground/15"
-          data-testid="onboarding-back"
-          onClick={actions.back}
-          type="button"
-          variant="ghost"
-        >
-          Back
         </Button>
       </OnboardingFooter>
     </OnboardingSlideTransition>
@@ -717,7 +795,6 @@ export function SetupStep({
   onReadyRuntimeIdsChange,
 }: SetupStepProps) {
   const state = useSetupStepState();
-
   return (
     <SetupStepContent
       actions={actions}

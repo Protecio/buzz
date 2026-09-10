@@ -1,6 +1,9 @@
 name: Docker image
 
-# Builds and publishes the public Buzz relay image as ghcr.io/block/buzz.
+# Builds and publishes the Buzz relay images.
+# Supports public multi-arch images and Protecio managed private runtime publication.
+# Normal tags contain stripped binaries; matching debug-* tags contain the same
+# optimized binaries with line-table debug information for native profilers.
 #
 # Strategy: each architecture builds on its native runner (ubuntu-24.04 for
 # amd64, ubuntu-24.04-arm for arm64), pushes to GHCR by digest, then a final
@@ -15,8 +18,10 @@ name: Docker image
 #
 # Triggers:
 #   - push to main           → :main + :sha-<7>
+#                              + :debug-main + :debug-sha-<7>
 #   - push tags relay-v*.*.* → :{version} + :{major}.{minor} + :{major}
-#                              (+ :latest for stable, NOT for prereleases)
+#                              + matching :debug-* tags
+#                              (+ :latest/:debug-latest for stable releases)
 #   - pull_request           → build only (no push), cache stays warm
 #   - workflow_dispatch      → manual relay-tag rescue at the tag itself
 #
@@ -45,6 +50,10 @@ on:
       - "Dockerfile.push-gateway"
       - ".dockerignore"
       - ".github/workflows/docker.yml"
+      - "deploy/charts/buzz/Chart.yaml"
+      - "scripts/create-deployment-eligibility-predicate.jq"
+      - "scripts/select-qualified-ci-run.jq"
+      - "scripts/test-relay-image-eligibility-workflow.sh"
       - "Cargo.toml"
       - "Cargo.lock"
       - "rust-toolchain.toml"
@@ -72,7 +81,11 @@ env:
   # Single source of truth for the image name. Set GHCR_IMAGE as a repo
   # variable to override (e.g., for forks that want to push to their own
   # namespace without forking this file).
-  IMAGE_NAME: ${{ vars.GHCR_IMAGE != '' && vars.GHCR_IMAGE || 'ghcr.io/block/buzz' }}
+  IMAGE_NAME: ${{ vars.GHCR_IMAGE != '' && vars.GHCR_IMAGE || format('ghcr.io/{0}/buzz', github.repository_owner) }}
+  PUSH_GATEWAY_IMAGE: ${{ vars.GHCR_PUSH_GATEWAY_IMAGE != '' && vars.GHCR_PUSH_GATEWAY_IMAGE || format('ghcr.io/{0}/buzz-push-gateway', github.repository_owner) }}
+  GAR_IMAGE: northamerica-northeast1-docker.pkg.dev/protecio-ai-503315/protecio-runtime/buzz
+  GCP_WORKLOAD_IDENTITY_PROVIDER: projects/877229499544/locations/global/workloadIdentityPools/github/providers/protecio-repo
+  GCP_PUBLISHER_SERVICE_ACCOUNT: protecio-buzz-publisher@protecio-ai-503315.iam.gserviceaccount.com
 
 jobs:
   build:
@@ -95,13 +108,9 @@ jobs:
             runner: ubuntu-24.04-arm
             arch: arm64
 
-    outputs:
-      # Used downstream by `merge` to stitch the manifest.
-      version: ${{ steps.meta.outputs.version }}
-
     steps:
       - name: Checkout
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -163,14 +172,19 @@ jobs:
             org.opencontainers.image.description=WebSocket relay server for the Buzz communications platform
             org.opencontainers.image.licenses=Apache-2.0
 
-      - name: Build and push by digest
-        id: build
+      - name: Build and push release image by digest
+        id: build-release
         uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf  # v7.2.0
         with:
           context: .
           file: ./Dockerfile
+          target: runtime
           platforms: ${{ matrix.platform }}
           labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            BUZZ_SOURCE_SHA=${{ github.sha }}
+            BUZZ_BUILD_ID=github-actions:${{ github.run_id }}:${{ github.run_attempt }}
+            BUZZ_BUILD_URL=https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}/attempts/${{ github.run_attempt }}
           # Push by digest, not by tag — the merge job assembles the tags
           # into one multi-arch manifest. This is what makes the native-arm
           # matrix possible.
@@ -180,41 +194,157 @@ jobs:
           cache-to: |
             ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && format('type=registry,ref={0}-buildcache:{1},mode=max,compression=zstd', env.IMAGE_NAME, matrix.arch) || '' }}
 
-      - name: Export digest
+      - name: Build and push debug image by digest
+        id: build-debug
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf  # v7.2.0
+        with:
+          context: .
+          file: ./Dockerfile
+          target: runtime-debug
+          platforms: ${{ matrix.platform }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            BUZZ_SOURCE_SHA=${{ github.sha }}
+            BUZZ_BUILD_ID=github-actions:${{ github.run_id }}:${{ github.run_attempt }}
+            BUZZ_BUILD_URL=https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}/attempts/${{ github.run_attempt }}
+          outputs: type=image,name=${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=${{ github.event_name != 'pull_request' }}
+          cache-from: |
+            type=registry,ref=${{ env.IMAGE_NAME }}-buildcache:${{ matrix.arch }}
+
+      - name: Export release and debug digests
         if: github.event_name != 'pull_request'
         env:
-          DIGEST: ${{ steps.build.outputs.digest }}
+          RELEASE_DIGEST: ${{ steps.build-release.outputs.digest }}
+          DEBUG_DIGEST: ${{ steps.build-debug.outputs.digest }}
         run: |
-          mkdir -p /tmp/digests
-          touch "/tmp/digests/${DIGEST#sha256:}"
+          mkdir -p /tmp/digests-release /tmp/digests-debug
+          touch "/tmp/digests-release/${RELEASE_DIGEST#sha256:}"
+          touch "/tmp/digests-debug/${DEBUG_DIGEST#sha256:}"
 
-      - name: Upload digest
+      - name: Upload release digest
         if: github.event_name != 'pull_request'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
-          name: digests-${{ matrix.arch }}
-          path: /tmp/digests/*
+          name: digests-release-${{ matrix.arch }}
+          path: /tmp/digests-release/*
           if-no-files-found: error
           retention-days: 1
 
-  merge:
-    name: Merge multi-arch manifest
+      - name: Upload debug digest
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: digests-debug-${{ matrix.arch }}
+          path: /tmp/digests-debug/*
+          if-no-files-found: error
+          retention-days: 1
+
+  qualify:
+    name: Qualify relay image source
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
-    needs: build
+    timeout-minutes: 70
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      source_sha: ${{ steps.qualify.outputs.source_sha }}
+      ci_run_id: ${{ steps.qualify.outputs.ci_run_id }}
+      ci_run_attempt: ${{ steps.qualify.outputs.ci_run_attempt }}
+      ci_run_url: ${{ steps.qualify.outputs.ci_run_url }}
+      chart_version: ${{ steps.qualify.outputs.chart_version }}
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
+        with:
+          persist-credentials: false
+
+      - name: Require successful same-SHA CI run
+        id: qualify
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+
+          if [[ ! "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::Invalid source SHA: $SOURCE_SHA"
+            exit 1
+          fi
+
+          deadline=$((SECONDS + 3900))
+          while (( SECONDS < deadline )); do
+            payload=$(gh api \
+              "/repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/runs?head_sha=${SOURCE_SHA}&event=push&per_page=100")
+            successful_run=$(jq -c --arg source_sha "$SOURCE_SHA" \
+              -f "$GITHUB_WORKSPACE/scripts/select-qualified-ci-run.jq" <<<"$payload")
+
+            if [[ -n "$successful_run" ]]; then
+              ci_run_id=$(jq -r '.id' <<<"$successful_run")
+              ci_run_attempt=$(jq -r '.run_attempt' <<<"$successful_run")
+              ci_run_url=$(jq -r '.html_url' <<<"$successful_run")
+              chart_version=$(awk '/^version:/ { print $2; exit }' deploy/charts/buzz/Chart.yaml)
+              if [[ ! "$chart_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$ ]]; then
+                echo "::error::Invalid Buzz chart version: $chart_version"
+                exit 1
+              fi
+              {
+                echo "source_sha=$SOURCE_SHA"
+                echo "ci_run_id=$ci_run_id"
+                echo "ci_run_attempt=$ci_run_attempt"
+                echo "ci_run_url=$ci_run_url"
+                echo "chart_version=$chart_version"
+              } >>"$GITHUB_OUTPUT"
+              echo "Qualified source $SOURCE_SHA with CI run $ci_run_id (attempt $ci_run_attempt)."
+              exit 0
+            fi
+
+            matching=$(jq --arg source_sha "$SOURCE_SHA" '[.workflow_runs[] | select(.head_sha == $source_sha) | select(.event == "push") | select(.head_branch == "main" or .head_branch == "release")] | length' <<<"$payload")
+            pending=$(jq --arg source_sha "$SOURCE_SHA" '[.workflow_runs[] | select(.head_sha == $source_sha) | select(.event == "push") | select(.head_branch == "main" or .head_branch == "release") | select(.status != "completed")] | length' <<<"$payload")
+            if (( matching > 0 && pending == 0 )); then
+              echo "::error::No successful CI run exists for source $SOURCE_SHA"
+              jq -r --arg source_sha "$SOURCE_SHA" '.workflow_runs[] | select(.head_sha == $source_sha) | "run=\(.id) attempt=\(.run_attempt) status=\(.status) conclusion=\(.conclusion)"' <<<"$payload"
+              exit 1
+            fi
+
+            echo "Waiting for same-SHA CI qualification ($matching matching, $pending pending)..."
+            sleep 30
+          done
+
+          echo "::error::Timed out waiting for successful CI qualification of $SOURCE_SHA"
+          exit 1
+
+  merge:
+    name: Merge ${{ matrix.variant }} multi-arch manifest
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    needs: [build, qualify]
     timeout-minutes: 15
     permissions:
       contents: read
       packages: write    # push the merged manifest
       id-token: write    # OIDC for provenance attestation on the manifest
       attestations: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: release
+            tag_prefix: ""
+          - variant: debug
+            tag_prefix: debug-
 
     steps:
+      - name: Checkout source
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
+        with:
+          persist-credentials: false
+
       - name: Download all per-arch digests
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
         with:
           path: /tmp/digests
-          pattern: digests-*
+          pattern: digests-${{ matrix.variant }}-*
           merge-multiple: true
 
       - name: Set up Docker Buildx
@@ -237,9 +367,12 @@ jobs:
           # the build job's `meta` step for why match=^relay-v(.*)$, why
           # value=${{ inputs.version }} carries the rescue-dispatch version,
           # and why :latest is left to flavor.latest=auto.
+          flavor: |
+            latest=auto
+            prefix=${{ matrix.tag_prefix }},onlatest=true
           tags: |
             type=ref,event=branch,enable=${{ github.event_name != 'workflow_dispatch' || inputs.version == '' }}
-            type=sha,prefix=sha-,format=short,enable=${{ github.event_name != 'workflow_dispatch' || inputs.version == '' }}
+            type=sha,prefix=${{ matrix.tag_prefix }}sha-,format=short,enable=${{ github.event_name != 'workflow_dispatch' || inputs.version == '' }}
             type=semver,pattern={{version}},match=^relay-v(.*)$,value=${{ inputs.version }}
             type=semver,pattern={{major}}.{{minor}},match=^relay-v(.*)$,value=${{ inputs.version }}
             type=semver,pattern={{major}},match=^relay-v(.*)$,value=${{ inputs.version }}
@@ -250,6 +383,10 @@ jobs:
         env:
           IMAGE_NAME: ${{ env.IMAGE_NAME }}
           META_TAGS: ${{ steps.meta.outputs.tags }}
+          SOURCE_SHA: ${{ needs.qualify.outputs.source_sha }}
+          CI_RUN_ID: ${{ needs.qualify.outputs.ci_run_id }}
+          CI_RUN_ATTEMPT: ${{ needs.qualify.outputs.ci_run_attempt }}
+          CHART_VERSION: ${{ needs.qualify.outputs.chart_version }}
         run: |
           set -euo pipefail
           # Build -t flags from the metadata-action output.
@@ -264,7 +401,15 @@ jobs:
             digests+=("${IMAGE_NAME}@sha256:${digest}")
           done
 
-          docker buildx imagetools create "${tags[@]}" "${digests[@]}"
+          annotations=(
+            --annotation "index:org.opencontainers.image.revision=${SOURCE_SHA}"
+            --annotation "index:xyz.block.buzz.build.id=github-actions:${GITHUB_RUN_ID}:${GITHUB_RUN_ATTEMPT}"
+            --annotation "index:xyz.block.buzz.qualification.ci-run-id=${CI_RUN_ID}"
+            --annotation "index:xyz.block.buzz.qualification.ci-run-attempt=${CI_RUN_ATTEMPT}"
+            --annotation "index:xyz.block.buzz.qualification.ci-conclusion=success"
+            --annotation "index:xyz.block.buzz.helm-chart.version=${CHART_VERSION}"
+          )
+          docker buildx imagetools create "${tags[@]}" "${annotations[@]}" "${digests[@]}"
 
           # Capture the merged manifest digest for the attestation step.
           first_tag=$(echo "$META_TAGS" | head -n1)
@@ -274,23 +419,123 @@ jobs:
 
       - name: Attest provenance for the merged image
         # Sigstore-signed in-toto attestation, verifiable with:
-        #   gh attestation verify oci://ghcr.io/block/buzz:<tag> --owner block
+        #   gh attestation verify oci://<configured-image>:<tag> --owner <repository-owner>
         uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373  # v4.1.1
         with:
           subject-name: ${{ env.IMAGE_NAME }}
           subject-digest: ${{ steps.manifest.outputs.digest }}
           push-to-registry: true
 
+      - name: Create deployment eligibility predicate
+        if: matrix.variant == 'release'
+        env:
+          SOURCE_SHA: ${{ needs.qualify.outputs.source_sha }}
+          CI_RUN_ID: ${{ needs.qualify.outputs.ci_run_id }}
+          CI_RUN_ATTEMPT: ${{ needs.qualify.outputs.ci_run_attempt }}
+          CI_RUN_URL: ${{ needs.qualify.outputs.ci_run_url }}
+          CHART_VERSION: ${{ needs.qualify.outputs.chart_version }}
+        run: |
+          jq -n \
+            --arg source_repository "$GITHUB_REPOSITORY" \
+            --arg source_ref "$GITHUB_REF" \
+            --arg source_sha "$SOURCE_SHA" \
+            --arg build_workflow ".github/workflows/docker.yml" \
+            --argjson build_run_id "$GITHUB_RUN_ID" \
+            --argjson build_run_attempt "$GITHUB_RUN_ATTEMPT" \
+            --arg build_run_url "https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/attempts/${GITHUB_RUN_ATTEMPT}" \
+            --arg qualification_workflow ".github/workflows/ci.yml" \
+            --argjson qualification_run_id "$CI_RUN_ID" \
+            --argjson qualification_run_attempt "$CI_RUN_ATTEMPT" \
+            --arg qualification_run_url "$CI_RUN_URL" \
+            --arg chart_version "$CHART_VERSION" \
+            -f "$GITHUB_WORKSPACE/scripts/create-deployment-eligibility-predicate.jq" \
+            >/tmp/deployment-eligibility.json
+
+      - name: Attest deployment eligibility
+        if: matrix.variant == 'release'
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6  # v4.2.2
+        with:
+          subject-name: ${{ env.IMAGE_NAME }}
+          subject-digest: ${{ steps.manifest.outputs.digest }}
+          predicate-type: https://buzz.block.xyz/attestations/deployment-eligibility/v1
+          predicate-path: /tmp/deployment-eligibility.json
+          push-to-registry: true
+
+      - name: Authenticate to Protecio Cloud without a service-account key
+        id: gcp-auth
+        if: env.GCP_WORKLOAD_IDENTITY_PROVIDER != ''
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093  # v3
+        with:
+          token_format: access_token
+          workload_identity_provider: ${{ env.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ env.GCP_PUBLISHER_SERVICE_ACCOUNT }}
+
+      - name: Configure the private Protecio registry
+        if: env.GCP_WORKLOAD_IDENTITY_PROVIDER != ''
+        uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db  # v3
+
+      - name: Log in to the private Protecio registry
+        if: env.GCP_WORKLOAD_IDENTITY_PROVIDER != ''
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee  # v4.2.0
+        with:
+          registry: northamerica-northeast1-docker.pkg.dev
+          username: oauth2accesstoken
+          password: ${{ steps.gcp-auth.outputs.access_token }}
+
+      - name: Publish the managed runtime to private Artifact Registry
+        id: private
+        if: env.GCP_WORKLOAD_IDENTITY_PROVIDER != ''
+        env:
+          GAR_IMAGE: ${{ env.GAR_IMAGE }}
+          META_TAGS: ${{ steps.meta.outputs.tags }}
+          MERGED_DIGEST: ${{ steps.manifest.outputs.digest }}
+          SOURCE_IMAGE: ${{ env.IMAGE_NAME }}
+        run: |
+          set -euo pipefail
+          gcloud auth configure-docker northamerica-northeast1-docker.pkg.dev --quiet
+
+          private_tags=()
+          while IFS= read -r source_tag; do
+            [ -n "$source_tag" ] || continue
+            private_tags+=("-t" "${GAR_IMAGE}:${source_tag##*:}")
+          done <<< "$META_TAGS"
+
+          docker buildx imagetools create \
+            "${private_tags[@]}" \
+            "${SOURCE_IMAGE}@${MERGED_DIGEST}"
+
+          first_private_tag="${GAR_IMAGE}:$(echo "$META_TAGS" | head -n1 | awk -F: '{print $NF}')"
+          private_digest="$(docker buildx imagetools inspect "$first_private_tag" \
+            --format '{{json .Manifest}}' | jq -r '.digest')"
+          test "$private_digest" = "$MERGED_DIGEST"
+          echo "digest=${private_digest}" >> "$GITHUB_OUTPUT"
+
+      - name: Attest provenance for the private Protecio runtime
+        if: env.GCP_WORKLOAD_IDENTITY_PROVIDER != ''
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373  # v4.1.1
+        with:
+          subject-name: ${{ env.GAR_IMAGE }}
+          subject-digest: ${{ steps.private.outputs.digest }}
+          push-to-registry: true
+
       - name: Summary
         env:
+          GAR_IMAGE: ${{ env.GAR_IMAGE }}
           IMAGE_NAME: ${{ env.IMAGE_NAME }}
+          VARIANT: ${{ matrix.variant }}
           MERGED_DIGEST: ${{ steps.manifest.outputs.digest }}
           META_TAGS: ${{ steps.meta.outputs.tags }}
+          SOURCE_SHA: ${{ needs.qualify.outputs.source_sha }}
+          CI_RUN_URL: ${{ needs.qualify.outputs.ci_run_url }}
+          CHART_VERSION: ${{ needs.qualify.outputs.chart_version }}
         run: |
           {
-            echo "### Published \`${IMAGE_NAME}\`"
+            echo "### Published \`${IMAGE_NAME}\` (${VARIANT})"
             echo
             echo "**Digest:** \`${MERGED_DIGEST}\`"
+            echo "**Source:** \`${SOURCE_SHA}\`"
+            echo "**Compatible Buzz chart:** \`${CHART_VERSION}\`"
+            echo "**Qualifying CI:** ${CI_RUN_URL} (success)"
             echo
             echo "**Tags:**"
             echo '```'
@@ -299,8 +544,20 @@ jobs:
             echo
             echo "Verify provenance:"
             echo '```'
-            echo "gh attestation verify oci://${IMAGE_NAME}@${MERGED_DIGEST} --owner block"
+            echo "gh attestation verify oci://${IMAGE_NAME}@${MERGED_DIGEST} --owner ${GITHUB_REPOSITORY_OWNER}"
             echo '```'
+            echo
+            echo "Protecio managed runtime (private):"
+            echo '```'
+            echo "${GAR_IMAGE}@${MERGED_DIGEST}"
+            echo '```'
+            if [[ "$VARIANT" == "release" ]]; then
+              echo
+              echo "Verify deployment eligibility:"
+              echo '```'
+              echo "gh attestation verify oci://${IMAGE_NAME}@${MERGED_DIGEST} --repo block/buzz --signer-workflow block/buzz/.github/workflows/docker.yml --predicate-type https://buzz.block.xyz/attestations/deployment-eligibility/v1 --source-digest ${SOURCE_SHA}"
+              echo '```'
+            fi
           } >> "$GITHUB_STEP_SUMMARY"
 
   push-gateway-build:
@@ -322,7 +579,7 @@ jobs:
             arch: arm64
     steps:
       - name: Checkout
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -350,7 +607,7 @@ jobs:
         id: meta
         uses: docker/metadata-action@80c7e94dd9b9319bd5eb7a0e0fe9291e23a2a2e9  # v6.1.0
         with:
-          images: ghcr.io/block/buzz-push-gateway
+          images: ${{ env.PUSH_GATEWAY_IMAGE }}
           labels: |
             org.opencontainers.image.title=Buzz Push Gateway
             org.opencontainers.image.description=Capability-gated APNs last hop for Buzz
@@ -363,9 +620,9 @@ jobs:
           file: ./Dockerfile.push-gateway
           platforms: ${{ matrix.platform }}
           labels: ${{ steps.meta.outputs.labels }}
-          outputs: type=image,name=ghcr.io/block/buzz-push-gateway,push-by-digest=true,name-canonical=true,push=${{ github.event_name != 'pull_request' }}
-          cache-from: type=registry,ref=ghcr.io/block/buzz-push-gateway-buildcache:${{ matrix.arch }}
-          cache-to: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && format('type=registry,ref=ghcr.io/block/buzz-push-gateway-buildcache:{0},mode=max,compression=zstd', matrix.arch) || '' }}
+          outputs: type=image,name=${{ env.PUSH_GATEWAY_IMAGE }},push-by-digest=true,name-canonical=true,push=${{ github.event_name != 'pull_request' }}
+          cache-from: type=registry,ref=${{ env.PUSH_GATEWAY_IMAGE }}-buildcache:${{ matrix.arch }}
+          cache-to: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && format('type=registry,ref={0}-buildcache:{1},mode=max,compression=zstd', env.PUSH_GATEWAY_IMAGE, matrix.arch) || '' }}
       - name: Export digest
         if: github.event_name != 'pull_request'
         env:
@@ -410,7 +667,7 @@ jobs:
         id: meta
         uses: docker/metadata-action@80c7e94dd9b9319bd5eb7a0e0fe9291e23a2a2e9  # v6.1.0
         with:
-          images: ghcr.io/block/buzz-push-gateway
+          images: ${{ env.PUSH_GATEWAY_IMAGE }}
           tags: |
             type=ref,event=branch,enable=${{ github.event_name != 'workflow_dispatch' || inputs.version == '' }}
             type=sha,prefix=sha-,format=short,enable=${{ github.event_name != 'workflow_dispatch' || inputs.version == '' }}
@@ -424,7 +681,7 @@ jobs:
         run: |
           set -euo pipefail
           tags=(); while IFS= read -r tag; do [ -n "$tag" ] && tags+=("-t" "$tag"); done <<< "$META_TAGS"
-          digests=(); for digest in *; do digests+=("ghcr.io/block/buzz-push-gateway@sha256:${digest}"); done
+          digests=(); for digest in *; do digests+=("${PUSH_GATEWAY_IMAGE}@sha256:${digest}"); done
           docker buildx imagetools create "${tags[@]}" "${digests[@]}"
           first_tag=$(echo "$META_TAGS" | head -n1)
           digest=$(docker buildx imagetools inspect "$first_tag" --format '{{json .Manifest}}' | jq -r '.digest')
@@ -432,7 +689,7 @@ jobs:
       - name: Attest gateway image provenance
         uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373  # v4.1.1
         with:
-          subject-name: ghcr.io/block/buzz-push-gateway
+          subject-name: ${{ env.PUSH_GATEWAY_IMAGE }}
           subject-digest: ${{ steps.manifest.outputs.digest }}
           push-to-registry: true
       - name: Gateway publication summary
@@ -442,7 +699,7 @@ jobs:
         run: |
           set -euo pipefail
           {
-            echo "### Published \`ghcr.io/block/buzz-push-gateway\`"
+            echo "### Published \`${PUSH_GATEWAY_IMAGE}\`"
             echo
             printf "**Digest:** \`%s\`\n" "$GATEWAY_DIGEST"
             echo
@@ -453,6 +710,6 @@ jobs:
             echo
             echo 'Verify provenance before deployment:'
             echo "\`\`\`"
-            printf 'gh attestation verify oci://ghcr.io/block/buzz-push-gateway@%s --owner block\n' "$GATEWAY_DIGEST"
+            printf 'gh attestation verify oci://%s@%s --owner %s\n' "$PUSH_GATEWAY_IMAGE" "$GATEWAY_DIGEST" "$GITHUB_REPOSITORY_OWNER"
             echo "\`\`\`"
           } >> "$GITHUB_STEP_SUMMARY"
